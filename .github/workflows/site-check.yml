@@ -1,0 +1,81 @@
+name: site-check
+
+# Lixo outage 24-Nov-2026, RCA item 8: a second outside eye that needs neither the server nor the Mac.
+# Every 30 minutes GitHub's own runner asks https://erp.lixo.co.in/health/ready (answers 200 only when the
+# DATABASE answers too). Down twice in a row (20 s apart) → the run goes red (GitHub e-mails the owner) and ONE
+# open issue "Live site check failing" (GitHub e-mails the repo watchers). Up again → a "back" comment and the
+# issue closes. This repo is public on purpose: public repos get free Actions minutes, so this never uses the
+# 2,000 private minutes. No code, no secrets here — only the public URL.
+on:
+  schedule:
+    - cron: '7,37 * * * *'      # every 30 min (GitHub may start a few minutes late)
+    - cron: '23 4 1 * *'        # monthly keep-alive commit (GitHub pauses schedules after 60 days with no commit)
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Page to check (fire drill: give a wrong page once)'
+        default: 'https://erp.lixo.co.in/health/ready'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: site-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.event.schedule != '23 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      URL: ${{ inputs.url || 'https://erp.lixo.co.in/health/ready' }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      TITLE: Live site check failing
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the page
+        id: check
+        run: |
+          set +e
+          out=$(bash check.sh "$URL"); rc=$?
+          echo "$out"
+          { echo "rc=$rc"; echo "last=$(echo "$out" | tail -1)"; } >> "$GITHUB_OUTPUT"
+      - name: Open or update the issue (down) / close it (back)
+        run: |
+          gh label create site-down --color B60205 --description "live site check failing" --force >/dev/null
+          open=$(gh issue list --label site-down --state open --json number -q '.[0].number')
+          now=$(TZ=Asia/Kolkata date '+%d-%b-%Y %H:%M IST')
+          if [ "${{ steps.check.outputs.rc }}" != 0 ]; then
+            if [ -z "$open" ]; then
+              gh issue create --label site-down --title "$TITLE" --body "🚨 $now — ${{ steps.check.outputs.last }}
+
+          The live site or its database is not answering. On the server: \`df -h /\`, \`docker ps\` (lixo-postgres),
+          \`systemctl status lixo-api@blue lixo-api@green\`. Runbook: lixo-agents deploy/RESTORE.md.
+          Run: $RUN_URL
+          This issue closes by itself when the page answers again."
+            else
+              echo "issue #$open already open — no new e-mail"
+            fi
+          elif [ -n "$open" ]; then
+            gh issue comment "$open" --body "✅ $now — back: ${{ steps.check.outputs.last }} ($RUN_URL)"
+            gh issue close "$open"
+          fi
+      - name: Red when down (GitHub e-mails the owner)
+        if: steps.check.outputs.rc != '0'
+        run: exit 1
+
+  keepalive:
+    if: github.event.schedule == '23 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          date -u +%FT%TZ > .keepalive
+          git config user.name "site-check keep-alive"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive && git commit -m "keep-alive (GitHub pauses schedules after 60 days with no commit)" && git push
